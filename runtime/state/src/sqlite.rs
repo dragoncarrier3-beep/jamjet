@@ -42,11 +42,27 @@ impl SqliteBackend {
         backend.migrate().await?;
         Ok(backend)
     }
+
+    /// Create a tenant-scoped view of this backend.
+    ///
+    /// All operations on the returned backend are filtered by `tenant_id`,
+    /// ensuring complete data isolation between tenants.
+    pub fn for_tenant(
+        &self,
+        tenant_id: crate::tenant::TenantId,
+    ) -> crate::tenant_scoped::TenantScopedSqliteBackend {
+        crate::tenant_scoped::TenantScopedSqliteBackend::new(self.pool.clone(), tenant_id)
+    }
+
+    /// Get a clone of the underlying connection pool.
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn map_db_err(e: sqlx::Error) -> StateBackendError {
+pub(crate) fn map_db_err(e: sqlx::Error) -> StateBackendError {
     StateBackendError::Database(e.to_string())
 }
 
@@ -54,13 +70,13 @@ fn execution_id_str(id: &ExecutionId) -> String {
     id.0.to_string()
 }
 
-fn parse_execution_id(s: &str) -> BackendResult<ExecutionId> {
+pub(crate) fn parse_execution_id(s: &str) -> BackendResult<ExecutionId> {
     let uuid = Uuid::parse_str(s)
         .map_err(|e| StateBackendError::Database(format!("invalid execution_id: {e}")))?;
     Ok(ExecutionId(uuid))
 }
 
-fn parse_datetime(s: &str) -> BackendResult<DateTime<Utc>> {
+pub(crate) fn parse_datetime(s: &str) -> BackendResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| StateBackendError::Database(format!("invalid datetime: {e}")))
@@ -170,6 +186,10 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
 
     let max_attempts: i64 = row.try_get("max_attempts").unwrap_or(3);
 
+    let tenant_id: String = row
+        .try_get("tenant_id")
+        .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+
     Ok(WorkItem {
         id,
         execution_id,
@@ -183,6 +203,7 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
         worker_id: row
             .try_get::<Option<String>, _>("worker_id")
             .map_err(map_db_err)?,
+        tenant_id,
     })
 }
 
@@ -198,13 +219,14 @@ impl StateBackend for SqliteBackend {
         let created_at = def.created_at.to_rfc3339();
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO workflow_definitions (workflow_id, version, ir_json, created_at)
-               VALUES (?, ?, ?, ?)"#,
+            r#"INSERT OR REPLACE INTO workflow_definitions (workflow_id, version, ir_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?)"#,
         )
         .bind(&def.workflow_id)
         .bind(&def.version)
         .bind(&ir_json)
         .bind(&created_at)
+        .bind(&def.tenant_id)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -233,6 +255,10 @@ impl StateBackend for SqliteBackend {
                 .map_err(StateBackendError::Serialization)?;
         let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
 
+        let tenant_id: String = row
+            .try_get("tenant_id")
+            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+
         Ok(Some(WorkflowDefinition {
             workflow_id: row
                 .try_get::<String, _>("workflow_id")
@@ -240,6 +266,7 @@ impl StateBackend for SqliteBackend {
             version: row.try_get::<String, _>("version").map_err(map_db_err)?,
             ir,
             created_at,
+            tenant_id,
         }))
     }
 
@@ -813,6 +840,7 @@ impl StateBackend for SqliteBackend {
             role: role.to_string(),
             created_at: Utc::now(),
             expires_at: None,
+            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
         };
         Ok((token, info))
     }
@@ -848,6 +876,9 @@ impl StateBackend for SqliteBackend {
             .map_err(map_db_err)?;
 
         let expires_at: Option<String> = row.get("expires_at");
+        let tenant_id: String = row
+            .try_get("tenant_id")
+            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
         let info = ApiToken {
             id,
             name: row.get("name"),
@@ -857,6 +888,7 @@ impl StateBackend for SqliteBackend {
                 .parse::<chrono::DateTime<Utc>>()
                 .unwrap_or_else(|_| Utc::now()),
             expires_at: expires_at.and_then(|s| s.parse().ok()),
+            tenant_id,
         };
         Ok(Some(info))
     }
@@ -976,6 +1008,7 @@ mod tests {
             version: "1.0.0".to_string(),
             ir: json!({"workflow_id": "my-wf", "version": "1.0.0", "nodes": {}}),
             created_at: Utc::now(),
+            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
         };
         db.store_workflow(def).await.unwrap();
 
@@ -1006,6 +1039,7 @@ mod tests {
             created_at: Utc::now(),
             lease_expires_at: None,
             worker_id: None,
+            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
         };
         let item_id = item.id;
         db.enqueue_work_item(item).await.unwrap();
