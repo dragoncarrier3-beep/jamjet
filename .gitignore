@@ -24,13 +24,10 @@ dist/
 *.db-wal
 
 # Environment
-.env
-.env.*
 !.env.example
 
 # Editor
 .idea/
-.vscode/
 *.swp
 *.swo
 
@@ -91,3 +88,5 @@ tmp/
 *.sqlite
 *.sqlite3
 .worktrees/
+config.bat
+node_modules
